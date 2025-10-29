@@ -1,5 +1,5 @@
 use std::ffi::OsStr;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -98,6 +98,7 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+    progress("Collecting repository context...");
     let repo_root = get_repo_root()?;
     let git = GitRunner { root: repo_root };
 
@@ -112,6 +113,7 @@ async fn run() -> Result<()> {
         .and_then(|name| extract_ticket(name))
         .map(|s| s.to_string());
 
+    progress("Analyzing working tree changes...");
     let status_entries = git.status_entries()?;
     if status_entries.is_empty() {
         bail!("no changes detected in the working tree");
@@ -125,15 +127,23 @@ async fn run() -> Result<()> {
         changes: diffs,
     };
 
+    progress("Contacting OpenAI for commit plan (this may take a moment)...");
     let openai = OpenAiClient::new(cli.openai_base_url, cli.model).await?;
     let plan = openai.build_plan(&context).await?;
+    progress(&format!(
+        "Received AI plan with {} proposed commit(s)",
+        plan.commits.len()
+    ));
 
     if cli.dry_run {
+        progress("Dry run enabled; no commits will be created.");
         print_plan(&plan)?;
         return Ok(());
     }
 
+    progress("Ensuring repository is in sync...");
     git.ensure_head_in_sync()?;
+    progress("Applying commit plan...");
     let applied = git.apply_plan(&plan)?;
     if applied.is_empty() {
         bail!("no commits were created; check plan output or run with --dry-run");
@@ -371,6 +381,7 @@ impl GitRunner {
     fn apply_plan(&self, plan: &AiPlan) -> Result<Vec<String>> {
         let mut created = Vec::new();
         for commit in &plan.commits {
+            progress(&format!("Preparing commit '{}'", commit.title));
             self.stage_files(&commit.files)?;
             if !self.has_staged_changes()? {
                 eprintln!(
@@ -379,6 +390,7 @@ impl GitRunner {
                 );
                 continue;
             }
+            progress(&format!("Creating commit '{}'", commit.title));
             let message = compose_commit_message(commit);
             self.create_commit(&message)?;
             created.push(commit.title.clone());
@@ -570,6 +582,11 @@ Repository context:\n```json\n{}\n```",
             serde_json::from_str(content).context("failed to parse plan JSON from OpenAI")?;
         Ok(plan)
     }
+}
+
+fn progress(message: impl AsRef<str>) {
+    println!("[create-commit] {}", message.as_ref());
+    let _ = io::stdout().flush();
 }
 
 fn compose_commit_message(commit: &AiCommit) -> String {
