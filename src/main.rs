@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::io::{self, Write};
@@ -237,6 +237,7 @@ async fn run() -> Result<()> {
         cli.provider
     ));
     let mut plan = ai_client.build_plan(&prompts).await?;
+    sanitize_plan(&mut plan, &context);
     ai_client.refine_commits(&mut plan, &context).await?;
     progress(&format!(
         "Received AI plan with {} proposed commit(s)",
@@ -612,7 +613,6 @@ impl OpenAiClient {
                 {"role": "system", "content": prompts.system.as_str()},
                 {"role": "user", "content": prompts.user.as_str()}
             ],
-            "temperature": 0.15,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": schema
@@ -729,17 +729,6 @@ Do not include markdown code fences or additional narration.",
     }
 
     async fn refine_commits(&self, plan: &mut AiPlan, context: &CommitContext) -> Result<()> {
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "title": {"type": "string"},
-                "body": {"type": "string"}
-            },
-            "required": ["title"],
-            "additionalProperties": false
-        });
-        let schema_text = serde_json::to_string_pretty(&schema)?;
-
         let diff_map: HashMap<&str, &FileDiff> = context
             .changes
             .iter()
@@ -783,13 +772,15 @@ Expand the body only if additional context is necessary.",
             };
 
             let refinement_prompt = format!(
-                "You are refining a git commit message based on the diff of the files being committed. \
-Existing commit suggestion:\nTitle: {}\nBody: {}\n\n\
-{}\
+                "You are refining a git commit message based on the diff of the files being committed.\n\
+Existing commit suggestion:\n  Title: {}\n  Body: {}\n\n\
 {}\n\
-Respond with JSON matching this schema:\n{}\n\
-Only include keys 'title' and optionally 'body'. \
-Ensure the title summarizes the changes and avoids repeating the branch name.",
+Diff excerpt (truncated if large):\n{}\n\
+Return a single JSON object that looks like:\n{{\"title\": \"...\", \"body\": \"...\"}}\n\
+- Always include `title`.\n\
+- Include `body` only when extra explanation beyond the title is useful; otherwise omit it.\n\
+- Do not return schemas, code fences, or additional prose.\n\
+- Ensure the title summarizes the change, honors ticket requirements, and avoids repeating the branch name or duplicating the body.",
                 commit.title.trim(),
                 if current_body.is_empty() {
                     "<none>"
@@ -797,8 +788,7 @@ Ensure the title summarizes the changes and avoids repeating the branch name.",
                     current_body
                 },
                 guidance,
-                combined,
-                schema_text
+                combined
             );
 
             let body = json!({
@@ -847,9 +837,19 @@ Ensure the title summarizes the changes and avoids repeating the branch name.",
             match parse_json_str::<RefinedCommit>(&content) {
                 Ok(refined) => {
                     commit.title = refined.title.trim().to_string();
+                    let title_lower = commit.title.to_lowercase();
+                    let ticket_prefix_lower = context
+                        .ticket_hint
+                        .as_ref()
+                        .map(|ticket| format!("{}:", ticket.to_lowercase()));
                     commit.body = refined.body.and_then(|b| {
                         let trimmed = b.trim();
-                        if trimmed.is_empty() {
+                        let body_lower = trimmed.to_lowercase();
+                        let starts_with_ticket = ticket_prefix_lower
+                            .as_ref()
+                            .map(|prefix| body_lower.starts_with(prefix))
+                            .unwrap_or(false);
+                        if trimmed.is_empty() || body_lower == title_lower || starts_with_ticket {
                             None
                         } else {
                             Some(trimmed.to_string())
@@ -1064,6 +1064,10 @@ Use the observed commit history to infer the preferred style. \
 Return a JSON object that matches the provided schema exactly.\n\
 Commit titles must summarize the changes and must not repeat the branch name verbatim.\n\
 {ticket_general}\
+- Use only files listed in the repository context; never invent new paths.\n\
+- Each commit's `files` array must reference the relevant paths from the context.\n\
+- Provide a `body` only when you have extra detail that is not already in the title; otherwise omit it.\n\
+- Avoid duplicating the title text inside the body.\n\
 Schema (JSON):\n{schema_text}\n\n\
 Repository context (JSON):\n{context_json}\n\n\
 Respond only with JSON representing the commits. Do not wrap the response in code fences, markdown, or extra commentary."
@@ -1095,6 +1099,56 @@ fn extract_ticket(name: &str) -> Option<&str> {
     TICKET_RE
         .captures(name)
         .and_then(|caps| caps.get(1).map(|m| m.as_str()))
+}
+
+fn sanitize_plan(plan: &mut AiPlan, context: &CommitContext) {
+    let valid_files: HashSet<&str> = context
+        .changes
+        .iter()
+        .map(|diff| diff.path.as_str())
+        .collect();
+
+    for commit in &mut plan.commits {
+        let original = commit.files.len();
+        commit.files.retain(|file| {
+            let keep = valid_files.contains(file.as_str());
+            if !keep {
+                debug_log(&format!(
+                    "Dropping unknown file '{}' from commit '{}'",
+                    file, commit.title
+                ));
+            }
+            keep
+        });
+
+        if original > 0 && commit.files.is_empty() {
+            debug_log(&format!(
+                "Commit '{}' has no valid files after filtering",
+                commit.title
+            ));
+        }
+
+        if let Some(body) = commit.body.as_ref() {
+            if body.trim().eq_ignore_ascii_case(commit.title.trim()) {
+                debug_log(&format!(
+                    "Clearing body for commit '{}' because it duplicates the title",
+                    commit.title
+                ));
+                commit.body = None;
+            }
+        }
+    }
+
+    plan.commits.retain(|commit| {
+        let keep = !commit.files.is_empty();
+        if !keep {
+            debug_log(&format!(
+                "Removing commit '{}' because it has no files after filtering",
+                commit.title
+            ));
+        }
+        keep
+    });
 }
 
 fn truncate(value: &str, limit: usize) -> String {
