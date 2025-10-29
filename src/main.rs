@@ -1,17 +1,40 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::fmt;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
+enum Provider {
+    #[clap(alias = "openai")]
+    Openai,
+    #[clap(alias = "ollama")]
+    Ollama,
+}
+
+impl fmt::Display for Provider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Provider::Openai => write!(f, "OpenAI"),
+            Provider::Ollama => write!(f, "Ollama"),
+        }
+    }
+}
+
+const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
+const DEFAULT_OLLAMA_MODEL: &str = "llama3.2";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -36,13 +59,25 @@ struct Cli {
     #[arg(long, default_value_t = 6000)]
     diff_char_limit: usize,
 
+    /// Select the AI provider to use (openai or ollama)
+    #[arg(long, value_enum, default_value_t = Provider::Openai)]
+    provider: Provider,
+
     /// Override the OpenAI base URL (defaults to https://api.openai.com/v1)
     #[arg(long)]
     openai_base_url: Option<String>,
 
-    /// Override the model name (defaults to env OPENAI_MODEL or gpt-5-mini)
+    /// Override the OpenAI model name (defaults to env OPENAI_MODEL or gpt-5-mini)
     #[arg(long)]
     model: Option<String>,
+
+    /// Override the Ollama model name (defaults to env OLLAMA_MODEL or llama3.2)
+    #[arg(long)]
+    ollama_model: Option<String>,
+
+    /// Override the Ollama base URL (defaults to http://localhost:11434)
+    #[arg(long)]
+    ollama_base_url: Option<String>,
 }
 
 #[derive(Debug)]
@@ -61,6 +96,7 @@ struct FileDiff {
 struct CommitContext {
     branch: Option<String>,
     ticket_hint: Option<String>,
+    ticket_required: bool,
     recent_commit_examples: Vec<String>,
     changes: Vec<FileDiff>,
 }
@@ -82,7 +118,64 @@ struct AiCommit {
     rationale: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct PromptBundle {
+    system: String,
+    user: String,
+    schema: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefinedCommit {
+    title: String,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+enum AiClient {
+    OpenAi(OpenAiClient),
+    Ollama(OllamaClient),
+}
+
+impl AiClient {
+    async fn new(cli: &Cli) -> Result<Self> {
+        match cli.provider {
+            Provider::Openai => {
+                let client =
+                    OpenAiClient::new(cli.openai_base_url.clone(), cli.model.clone()).await?;
+                Ok(Self::OpenAi(client))
+            }
+            Provider::Ollama => {
+                let client =
+                    OllamaClient::new(cli.ollama_base_url.clone(), cli.ollama_model.clone())
+                        .await?;
+                Ok(Self::Ollama(client))
+            }
+        }
+    }
+
+    async fn build_plan(&self, prompts: &PromptBundle) -> Result<AiPlan> {
+        match self {
+            AiClient::OpenAi(client) => client.build_plan(prompts).await,
+            AiClient::Ollama(client) => client.build_plan(prompts).await,
+        }
+    }
+
+    async fn refine_commits(&self, plan: &mut AiPlan, context: &CommitContext) -> Result<()> {
+        match self {
+            AiClient::OpenAi(_) => Ok(()),
+            AiClient::Ollama(client) => client.refine_commits(plan, context).await,
+        }
+    }
+}
+
 struct OpenAiClient {
+    http: Client,
+    base_url: String,
+    model: String,
+}
+
+struct OllamaClient {
     http: Client,
     base_url: String,
     model: String,
@@ -98,6 +191,7 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+    progress(&format!("Using {} provider", cli.provider));
     progress("Collecting repository context...");
     let repo_root = get_repo_root()?;
     let git = GitRunner { root: repo_root };
@@ -112,6 +206,9 @@ async fn run() -> Result<()> {
         .as_ref()
         .and_then(|name| extract_ticket(name))
         .map(|s| s.to_string());
+    let ticket_required = ticket_hint.as_ref().map_or(false, |ticket| {
+        recent_commits.iter().any(|msg| msg.contains(ticket))
+    });
 
     progress("Analyzing working tree changes...");
     let status_entries = git.status_entries()?;
@@ -123,13 +220,24 @@ async fn run() -> Result<()> {
     let context = CommitContext {
         branch: branch.clone(),
         ticket_hint,
+        ticket_required,
         recent_commit_examples: recent_commits,
         changes: diffs,
     };
 
-    progress("Contacting OpenAI for commit plan (this may take a moment)...");
-    let openai = OpenAiClient::new(cli.openai_base_url, cli.model).await?;
-    let plan = openai.build_plan(&context).await?;
+    let prompts = build_prompts(&context)?;
+    debug_log(&format!("System prompt: {}", prompts.system));
+    debug_log(&format!(
+        "User prompt snippet: {}",
+        truncate(&prompts.user, 500)
+    ));
+    let ai_client = AiClient::new(&cli).await?;
+    progress(&format!(
+        "Contacting {} for commit plan (this may take a moment)...",
+        cli.provider
+    ));
+    let mut plan = ai_client.build_plan(&prompts).await?;
+    ai_client.refine_commits(&mut plan, &context).await?;
     progress(&format!(
         "Received AI plan with {} proposed commit(s)",
         plan.commits.len()
@@ -496,56 +604,15 @@ impl OpenAiClient {
         })
     }
 
-    async fn build_plan(&self, context: &CommitContext) -> Result<AiPlan> {
-        let schema = json!({
-            "name": "commit_plan",
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "commits": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "title": {"type": "string"},
-                                "body": {"type": "string"},
-                                "files": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "minItems": 1
-                                },
-                                "rationale": {"type": "string"}
-                            },
-                            "required": ["title", "files"]
-                        }
-                    },
-                    "notes": {"type": "string"}
-                },
-                "required": ["commits"],
-                "additionalProperties": false
-            }
-        });
-
-        let system_prompt = "You are an assistant that writes git commit plans. \
-Respect project conventions, include ticket identifiers when appropriate, \
-and prefer smaller, focused commits.";
-
-        let context_json = serde_json::to_string_pretty(context)?;
-        let user_prompt = format!(
-            "Generate a set of clean commits for the current working tree. \
-Use the observed commit history to infer the preferred style. \
-If the branch name includes a ticket reference, include it in each relevant commit title. \
-Return JSON that matches the provided schema. \
-Repository context:\n```json\n{}\n```",
-            context_json
-        );
-
+    async fn build_plan(&self, prompts: &PromptBundle) -> Result<AiPlan> {
+        let schema = prompts.schema.clone();
         let body = json!({
             "model": self.model,
             "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "system", "content": prompts.system.as_str()},
+                {"role": "user", "content": prompts.user.as_str()}
             ],
+            "temperature": 0.15,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": schema
@@ -572,21 +639,441 @@ Repository context:\n```json\n{}\n```",
         }
 
         let payload: Value = response.json().await.context("invalid OpenAI response")?;
+        debug_log(&format!("OpenAI raw payload: {}", payload));
         let Some(choice) = payload["choices"].get(0) else {
             bail!("OpenAI response missing choices");
         };
         let content = choice["message"]["content"]
             .as_str()
             .ok_or_else(|| anyhow!("OpenAI response missing content"))?;
-        let plan: AiPlan =
-            serde_json::from_str(content).context("failed to parse plan JSON from OpenAI")?;
+        debug_log(&format!("OpenAI content: {}", content));
+        parse_json_str(content)
+    }
+}
+
+impl OllamaClient {
+    async fn new(base: Option<String>, model: Option<String>) -> Result<Self> {
+        let base_url = base
+            .or_else(|| std::env::var("OLLAMA_BASE_URL").ok())
+            .unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string());
+        let model = model
+            .or_else(|| std::env::var("OLLAMA_MODEL").ok())
+            .unwrap_or_else(|| DEFAULT_OLLAMA_MODEL.to_string());
+
+        let http = Client::builder()
+            .no_proxy()
+            .build()
+            .context("failed to initialize HTTP client for Ollama")?;
+
+        Ok(Self {
+            http,
+            base_url,
+            model,
+        })
+    }
+
+    async fn build_plan(&self, prompts: &PromptBundle) -> Result<AiPlan> {
+        let mut user_prompt = prompts.user.clone();
+        user_prompt.push_str(
+            "\nRespond ONLY with a single JSON object matching the schema. \
+Do not include markdown code fences or additional narration.",
+        );
+
+        let body = json!({
+            "model": self.model,
+            "format": "json",
+            "messages": [
+                {"role": "system", "content": prompts.system.as_str()},
+                {"role": "user", "content": user_prompt}
+            ],
+            "stream": false,
+            "options": {
+                "temperature": 0.15
+            }
+        });
+
+        let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
+        let response = self
+            .http
+            .post(url)
+            .json(&body)
+            .send()
+            .await
+            .context("failed to call Ollama API")?;
+
+        if !response.status().is_success() {
+            bail!(
+                "Ollama API error: {}",
+                response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<unavailable>".to_string())
+            );
+        }
+
+        let payload: Value = response.json().await.context("invalid Ollama response")?;
+        debug_log(&format!("Ollama raw payload: {}", payload));
+        let content = Self::extract_content(payload)?;
+        debug_log(&format!("Ollama content: {}", content));
+        if content.trim().is_empty() {
+            bail!("Ollama returned an empty message");
+        }
+
+        let plan: AiPlan = serde_json::from_str(&content).map_err(|err| {
+            anyhow!(
+                "failed to parse plan JSON from Ollama: {err}; content snippet: {}",
+                truncate(&content, 500)
+            )
+        })?;
         Ok(plan)
     }
+
+    async fn refine_commits(&self, plan: &mut AiPlan, context: &CommitContext) -> Result<()> {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "body": {"type": "string"}
+            },
+            "required": ["title"],
+            "additionalProperties": false
+        });
+        let schema_text = serde_json::to_string_pretty(&schema)?;
+
+        let diff_map: HashMap<&str, &FileDiff> = context
+            .changes
+            .iter()
+            .map(|diff| (diff.path.as_str(), diff))
+            .collect();
+
+        for commit in &mut plan.commits {
+            let mut sections = Vec::new();
+            for file in &commit.files {
+                if let Some(diff) = diff_map.get(file.as_str()) {
+                    sections.push(format!(
+                        "File: {}\nSummary: {}\nDiff:\n{}\n",
+                        diff.path, diff.summary, diff.diff
+                    ));
+                } else {
+                    debug_log(&format!(
+                        "No diff captured for file '{}' during refinement",
+                        file
+                    ));
+                }
+            }
+
+            if sections.is_empty() {
+                continue;
+            }
+
+            let combined = truncate(&sections.join("\n"), 12000);
+            let current_body = commit.body.as_deref().unwrap_or("").trim();
+            let guidance = match (context.ticket_hint.as_deref(), context.ticket_required) {
+                (Some(ticket), true) => format!(
+                    "Craft a title that begins with '{ticket}: ' followed by a concise summary of the change. \
+If the summary already mentions the ticket, do not repeat it, but the prefix is mandatory."
+                ),
+                (Some(ticket), false) => format!(
+                    "If it improves clarity, include the ticket identifier '{ticket}' in the title, but only when it reads naturally."
+                ),
+                (None, _) => String::from(
+                    "Craft a title that clearly summarizes the logical change. \
+Expand the body only if additional context is necessary.",
+                ),
+            };
+
+            let refinement_prompt = format!(
+                "You are refining a git commit message based on the diff of the files being committed. \
+Existing commit suggestion:\nTitle: {}\nBody: {}\n\n\
+{}\
+{}\n\
+Respond with JSON matching this schema:\n{}\n\
+Only include keys 'title' and optionally 'body'. \
+Ensure the title summarizes the changes and avoids repeating the branch name.",
+                commit.title.trim(),
+                if current_body.is_empty() {
+                    "<none>"
+                } else {
+                    current_body
+                },
+                guidance,
+                combined,
+                schema_text
+            );
+
+            let body = json!({
+                "model": self.model,
+                "format": "json",
+                "messages": [
+                    {"role": "system", "content": "You improve git commit messages so they precisely summarize the associated diff."},
+                    {"role": "user", "content": refinement_prompt}
+                ],
+                "stream": false,
+                "options": {
+                    "temperature": 0.1
+                }
+            });
+
+            let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
+            let response = self
+                .http
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .context("failed to call Ollama API for commit refinement")?;
+
+            if !response.status().is_success() {
+                debug_log(&format!(
+                    "Ollama refinement error status {} for commit '{}'",
+                    response.status(),
+                    commit.title
+                ));
+                continue;
+            }
+
+            let payload: Value = response
+                .json()
+                .await
+                .context("invalid Ollama refinement response")?;
+            debug_log(&format!("Ollama refinement payload: {}", payload));
+            let content = Self::extract_content(payload)?;
+            debug_log(&format!("Ollama refinement content: {}", content));
+
+            if content.trim().is_empty() {
+                continue;
+            }
+
+            match parse_json_str::<RefinedCommit>(&content) {
+                Ok(refined) => {
+                    commit.title = refined.title.trim().to_string();
+                    commit.body = refined.body.and_then(|b| {
+                        let trimmed = b.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    });
+                }
+                Err(err) => {
+                    debug_log(&format!(
+                        "Failed to parse refinement JSON for commit '{}': {err}",
+                        commit.title
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn extract_content(payload: Value) -> Result<String> {
+        if let Some(msg) = payload
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(|c| c.as_str())
+        {
+            return Ok(msg.to_string());
+        }
+
+        if let Some(messages) = payload.get("messages").and_then(|m| m.as_array()) {
+            if let Some(text) = messages
+                .iter()
+                .rev()
+                .find(|msg| msg.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+                .and_then(|msg| {
+                    msg.get("content").map(|c| {
+                        if c.is_string() {
+                            c.as_str().map(|s| s.to_string())
+                        } else if let Some(array) = c.as_array() {
+                            Some(
+                                array
+                                    .iter()
+                                    .filter_map(|chunk| chunk.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(""),
+                            )
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .flatten()
+            {
+                return Ok(text);
+            }
+        }
+
+        bail!("Ollama response missing assistant message content")
+    }
+}
+
+fn parse_json_str<T>(content: &str) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    match serde_json::from_str(content) {
+        Ok(value) => Ok(value),
+        Err(primary_err) => {
+            if let Some(extracted) = extract_json_object(content) {
+                debug_log(&format!(
+                    "Attempting to parse extracted JSON snippet: {}",
+                    truncate(&extracted, 200)
+                ));
+                serde_json::from_str(&extracted).map_err(|err| {
+                    anyhow!(
+                        "failed to parse JSON after extraction: {err}; original content snippet: {}",
+                        truncate(content, 500)
+                    )
+                })
+            } else {
+                Err(anyhow!(
+                    "failed to parse JSON: {primary_err}; content snippet: {}",
+                    truncate(content, 500)
+                ))
+            }
+        }
+    }
+}
+
+fn extract_json_object(content: &str) -> Option<String> {
+    let mut in_string = false;
+    let mut escape = false;
+    let mut depth = 0usize;
+    let mut start_idx: Option<usize> = None;
+
+    for (idx, ch) in content.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+
+        match ch {
+            '\\' if in_string => {
+                escape = true;
+            }
+            '"' => {
+                in_string = !in_string;
+            }
+            '{' if !in_string => {
+                if depth == 0 {
+                    start_idx = Some(idx);
+                }
+                depth += 1;
+            }
+            '}' if !in_string => {
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(start) = start_idx {
+                            let end = idx + ch.len_utf8();
+                            return Some(content[start..end].to_string());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn progress(message: impl AsRef<str>) {
     println!("[create-commit] {}", message.as_ref());
     let _ = io::stdout().flush();
+}
+
+#[cfg(debug_assertions)]
+fn debug_log(message: impl AsRef<str>) {
+    eprintln!("[create-commit:debug] {}", message.as_ref());
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_log(_message: impl AsRef<str>) {}
+
+fn build_prompts(context: &CommitContext) -> Result<PromptBundle> {
+    let schema = json!({
+        "name": "commit_plan",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "commits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "body": {"type": "string"},
+                            "files": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 1
+                            },
+                            "rationale": {"type": "string"}
+                        },
+                        "required": ["title", "files"]
+                    }
+                },
+                "notes": {"type": "string"}
+            },
+            "required": ["commits"],
+            "additionalProperties": false
+        }
+    });
+
+    let schema_text = serde_json::to_string_pretty(
+        schema
+            .get("schema")
+            .ok_or_else(|| anyhow!("prompt schema missing definition"))?,
+    )?;
+
+    let system_prompt = "You are an assistant that writes git commit plans. \
+Respect project conventions, include ticket identifiers when appropriate, \
+and prefer smaller, focused commits.";
+
+    let context_json = serde_json::to_string_pretty(context)?;
+    let ticket_line = match (context.ticket_hint.as_deref(), context.ticket_required) {
+        (Some(ticket), true) => format!(
+            "Every commit title must begin with \"{ticket}: \" followed by a concise summary. \
+This convention is mandatory because recent commits use it."
+        ),
+        (Some(ticket), false) => format!(
+            "Prefer including the ticket identifier \"{ticket}\" in titles when it naturally fits."
+        ),
+        (None, _) => String::new(),
+    };
+
+    let optional_ticket = if ticket_line.is_empty() {
+        String::new()
+    } else {
+        format!("{ticket_line}\n")
+    };
+
+    let ticket_general = if context.ticket_hint.is_some() {
+        "When a ticket reference is available, prepend it followed by a concise summary (e.g. TICKET-123: Describe change).\n".to_string()
+    } else {
+        String::new()
+    };
+
+    let user_prompt = format!(
+        "Generate a set of focused commits for the current working tree. \
+Use the observed commit history to infer the preferred style. \
+{optional_ticket}\
+Return a JSON object that matches the provided schema exactly.\n\
+Commit titles must summarize the changes and must not repeat the branch name verbatim.\n\
+{ticket_general}\
+Schema (JSON):\n{schema_text}\n\n\
+Repository context (JSON):\n{context_json}\n\n\
+Respond only with JSON representing the commits. Do not wrap the response in code fences, markdown, or extra commentary."
+    );
+
+    Ok(PromptBundle {
+        system: system_prompt.to_string(),
+        user: user_prompt,
+        schema,
+    })
 }
 
 fn compose_commit_message(commit: &AiCommit) -> String {
