@@ -220,8 +220,6 @@ async fn run() -> Result<()> {
         bail!("staged changes detected; run with --allow-dirty-index to override");
     }
 
-    let ai_client = AiClient::new(&cli).await?;
-
     let mut pass = 1usize;
     let mut all_commits = Vec::new();
     let mut aggregated_notes = Vec::new();
@@ -268,18 +266,23 @@ async fn run() -> Result<()> {
             truncate(&prompts.user, 500)
         ));
 
-        progress(&format!(
-            "Contacting {} for commit plan (pass #{pass}, this may take a moment)...",
-            cli.provider
-        ));
-        let mut plan = ai_client.build_plan(&prompts).await?;
-        sanitize_plan(&mut plan, &context);
-        ai_client.refine_commits(&mut plan, &context).await?;
-        progress(&format!(
-            "Received AI plan with {} proposed commit(s) in pass #{}",
-            plan.commits.len(),
-            pass
-        ));
+        let plan = {
+            debug_log(&format!("Opening AI planning session for pass #{}", pass));
+            let ai_client = AiClient::new(&cli).await?;
+            progress(&format!(
+                "Contacting {} for commit plan (pass #{pass}, this may take a moment)...",
+                cli.provider
+            ));
+            let mut plan = ai_client.build_plan(&prompts).await?;
+            sanitize_plan(&mut plan, &context);
+            ai_client.refine_commits(&mut plan, &context).await?;
+            progress(&format!(
+                "Received AI plan with {} proposed commit(s) in pass #{}",
+                plan.commits.len(),
+                pass
+            ));
+            plan
+        };
 
         if cli.dry_run {
             progress("Dry run enabled; no commits will be created.");
