@@ -101,6 +101,26 @@ struct CommitContext {
     changes: Vec<FileDiff>,
 }
 
+#[derive(Debug, Clone)]
+struct TicketFormat {
+    prefix: String,
+    suffix: String,
+    separator: String,
+}
+
+impl TicketFormat {
+    fn with_summary(&self, ticket: &str, summary: &str) -> String {
+        format!(
+            "{}{}{}{}{}",
+            self.prefix, ticket, self.suffix, self.separator, summary
+        )
+    }
+
+    fn generic_example(&self, summary: &str) -> String {
+        self.with_summary("TICKET-123", summary)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct AiPlan {
     commits: Vec<AiCommit>,
@@ -200,71 +220,110 @@ async fn run() -> Result<()> {
         bail!("staged changes detected; run with --allow-dirty-index to override");
     }
 
-    let recent_commits = git.recent_commit_messages(cli.history_limit)?;
-    let branch = git.current_branch()?;
-    let ticket_hint = branch
-        .as_ref()
-        .and_then(|name| extract_ticket(name))
-        .map(|s| s.to_string());
-    let ticket_required = ticket_hint.as_ref().map_or(false, |ticket| {
-        recent_commits.iter().any(|msg| msg.contains(ticket))
-    });
-
-    progress("Analyzing working tree changes...");
-    let status_entries = git.status_entries()?;
-    if status_entries.is_empty() {
-        bail!("no changes detected in the working tree");
-    }
-
-    let diffs = git.collect_diffs(&status_entries, cli.diff_char_limit)?;
-    let context = CommitContext {
-        branch: branch.clone(),
-        ticket_hint,
-        ticket_required,
-        recent_commit_examples: recent_commits,
-        changes: diffs,
-    };
-
-    let prompts = build_prompts(&context)?;
-    debug_log(&format!("System prompt: {}", prompts.system));
-    debug_log(&format!(
-        "User prompt snippet: {}",
-        truncate(&prompts.user, 500)
-    ));
     let ai_client = AiClient::new(&cli).await?;
-    progress(&format!(
-        "Contacting {} for commit plan (this may take a moment)...",
-        cli.provider
-    ));
-    let mut plan = ai_client.build_plan(&prompts).await?;
-    sanitize_plan(&mut plan, &context);
-    ai_client.refine_commits(&mut plan, &context).await?;
-    progress(&format!(
-        "Received AI plan with {} proposed commit(s)",
-        plan.commits.len()
-    ));
 
-    if cli.dry_run {
-        progress("Dry run enabled; no commits will be created.");
-        print_plan(&plan)?;
-        return Ok(());
+    let mut pass = 1usize;
+    let mut all_commits = Vec::new();
+    let mut aggregated_notes = Vec::new();
+
+    loop {
+        if pass == 1 {
+            progress("Analyzing working tree changes...");
+        } else {
+            progress(&format!("Analyzing remaining changes (pass #{pass})..."));
+        }
+
+        let status_entries = git.status_entries()?;
+        if status_entries.is_empty() {
+            if pass == 1 {
+                bail!("no changes detected in the working tree");
+            } else {
+                break;
+            }
+        }
+
+        let diffs = git.collect_diffs(&status_entries, cli.diff_char_limit)?;
+        let recent_commits = git.recent_commit_messages(cli.history_limit)?;
+        let branch = git.current_branch()?;
+        let ticket_hint = branch
+            .as_ref()
+            .and_then(|name| extract_ticket(name))
+            .map(|s| s.to_string());
+        let ticket_required = ticket_hint.as_ref().map_or(false, |ticket| {
+            recent_commits.iter().any(|msg| msg.contains(ticket))
+        });
+
+        let context = CommitContext {
+            branch: branch.clone(),
+            ticket_hint,
+            ticket_required,
+            recent_commit_examples: recent_commits,
+            changes: diffs,
+        };
+
+        let prompts = build_prompts(&context)?;
+        debug_log(&format!("System prompt: {}", prompts.system));
+        debug_log(&format!(
+            "User prompt snippet: {}",
+            truncate(&prompts.user, 500)
+        ));
+
+        progress(&format!(
+            "Contacting {} for commit plan (pass #{pass}, this may take a moment)...",
+            cli.provider
+        ));
+        let mut plan = ai_client.build_plan(&prompts).await?;
+        sanitize_plan(&mut plan, &context);
+        ai_client.refine_commits(&mut plan, &context).await?;
+        progress(&format!(
+            "Received AI plan with {} proposed commit(s) in pass #{}",
+            plan.commits.len(),
+            pass
+        ));
+
+        if cli.dry_run {
+            progress("Dry run enabled; no commits will be created.");
+            print_plan(&plan)?;
+            return Ok(());
+        }
+
+        if pass == 1 {
+            progress("Ensuring repository is in sync...");
+            git.ensure_head_in_sync()?;
+        }
+
+        progress("Applying commit plan...");
+        let applied = git.apply_plan(&plan)?;
+        if applied.is_empty() {
+            bail!("no commits were created; check plan output or run with --dry-run");
+        }
+        progress(&format!(
+            "Completed pass #{} with {} commit(s).",
+            pass,
+            applied.len()
+        ));
+        all_commits.extend(applied);
+        if let Some(notes) = plan.notes.as_ref() {
+            aggregated_notes.push(notes.clone());
+        }
+
+        pass += 1;
     }
 
-    progress("Ensuring repository is in sync...");
-    git.ensure_head_in_sync()?;
-    progress("Applying commit plan...");
-    let applied = git.apply_plan(&plan)?;
-    if applied.is_empty() {
+    if all_commits.is_empty() {
         bail!("no commits were created; check plan output or run with --dry-run");
     }
 
-    println!("Created {} commit(s):", applied.len());
-    for commit in applied {
+    println!("Created {} commit(s):", all_commits.len());
+    for commit in &all_commits {
         println!("  - {}", commit);
     }
 
-    if let Some(notes) = plan.notes.as_ref() {
-        println!("\nAdditional notes:\n{notes}");
+    if !aggregated_notes.is_empty() {
+        println!("\nAdditional notes:");
+        for notes in aggregated_notes {
+            println!("{notes}");
+        }
     }
 
     Ok(())
@@ -673,17 +732,71 @@ impl OllamaClient {
     }
 
     async fn build_plan(&self, prompts: &PromptBundle) -> Result<AiPlan> {
-        let mut user_prompt = prompts.user.clone();
-        user_prompt.push_str(
-            "\nRespond ONLY with a single JSON object matching the schema. \
+        let base_prompt = format!(
+            "{}\nRespond ONLY with a single JSON object matching the schema. \
 Do not include markdown code fences or additional narration.",
+            prompts.user
         );
 
+        let example_plan = json!({
+            "commits": [
+                {
+                    "title": "TICKET-123: Describe the change",
+                    "files": ["path/to/file"]
+                }
+            ]
+        });
+        let mut example_text = serde_json::to_string_pretty(&example_plan)?;
+        example_text.push_str(
+            "\nOptional fields (`body`, `rationale`, `notes`) may be included when needed, but the structure must stay the same."
+        );
+
+        let prompt_variants = [
+            base_prompt.clone(),
+            format!(
+                "{}\nThe JSON MUST include a top-level `commits` array that follows the provided schema. \
+Avoid returning unrelated JSON structures.",
+                base_prompt
+            ),
+            format!(
+                "{}\nReturn JSON that mirrors this template exactly:\n{}",
+                base_prompt, example_text
+            ),
+        ];
+
+        let mut last_error: Option<anyhow::Error> = None;
+        for user_prompt in prompt_variants {
+            match self
+                .request_plan_content(&prompts.system, &user_prompt)
+                .await
+            {
+                Ok(content) => match parse_json_str::<AiPlan>(&content) {
+                    Ok(plan) if !plan.commits.is_empty() => return Ok(plan),
+                    Ok(_) => {
+                        last_error = Some(anyhow!(
+                            "Ollama returned a plan without any commits; content snippet: {}",
+                            truncate(&content, 500)
+                        ));
+                    }
+                    Err(err) => {
+                        last_error = Some(anyhow!("failed to parse plan JSON from Ollama: {err}"));
+                    }
+                },
+                Err(err) => {
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("failed to obtain plan from Ollama")))
+    }
+
+    async fn request_plan_content(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
         let body = json!({
             "model": self.model,
             "format": "json",
             "messages": [
-                {"role": "system", "content": prompts.system.as_str()},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
             "stream": false,
@@ -718,14 +831,7 @@ Do not include markdown code fences or additional narration.",
         if content.trim().is_empty() {
             bail!("Ollama returned an empty message");
         }
-
-        let plan: AiPlan = serde_json::from_str(&content).map_err(|err| {
-            anyhow!(
-                "failed to parse plan JSON from Ollama: {err}; content snippet: {}",
-                truncate(&content, 500)
-            )
-        })?;
-        Ok(plan)
+        Ok(content)
     }
 
     async fn refine_commits(&self, plan: &mut AiPlan, context: &CommitContext) -> Result<()> {
@@ -921,12 +1027,13 @@ where
                     "Attempting to parse extracted JSON snippet: {}",
                     truncate(&extracted, 200)
                 ));
-                serde_json::from_str(&extracted).map_err(|err| {
-                    anyhow!(
+                match serde_json::from_str(&extracted) {
+                    Ok(value) => Ok(value),
+                    Err(err) => Err(anyhow!(
                         "failed to parse JSON after extraction: {err}; original content snippet: {}",
                         truncate(content, 500)
-                    )
-                })
+                    )),
+                }
             } else {
                 Err(anyhow!(
                     "failed to parse JSON: {primary_err}; content snippet: {}",
@@ -1034,14 +1141,35 @@ Respect project conventions, include ticket identifiers when appropriate, \
 and prefer smaller, focused commits.";
 
     let context_json = serde_json::to_string_pretty(context)?;
+    let summary_placeholder = "Describe the change";
+    let detected_format = detect_ticket_format(&context.recent_commit_examples);
     let ticket_line = match (context.ticket_hint.as_deref(), context.ticket_required) {
-        (Some(ticket), true) => format!(
-            "Every commit title must begin with \"{ticket}: \" followed by a concise summary. \
+        (Some(ticket), true) => {
+            if let Some(format) = detected_format.as_ref() {
+                let example = format.with_summary(ticket, summary_placeholder);
+                format!(
+                    "Every commit title must begin with \"{example}\" (replace the summary text with an accurate description). \
 This convention is mandatory because recent commits use it."
-        ),
-        (Some(ticket), false) => format!(
-            "Prefer including the ticket identifier \"{ticket}\" in titles when it naturally fits."
-        ),
+                )
+            } else {
+                format!(
+                    "Every commit title must begin with \"{ticket}: {summary_placeholder}\" (adjust the summary to fit). \
+This convention is mandatory because recent commits use it."
+                )
+            }
+        }
+        (Some(ticket), false) => {
+            if let Some(format) = detected_format.as_ref() {
+                let example = format.with_summary(ticket, summary_placeholder);
+                format!(
+                    "Prefer starting the title with \"{example}\" when it suits the change, mirroring the existing history."
+                )
+            } else {
+                format!(
+                    "Prefer including the ticket identifier \"{ticket}\" in titles when it naturally fits."
+                )
+            }
+        }
         (None, _) => String::new(),
     };
 
@@ -1052,7 +1180,13 @@ This convention is mandatory because recent commits use it."
     };
 
     let ticket_general = if context.ticket_hint.is_some() {
-        "When a ticket reference is available, prepend it followed by a concise summary (e.g. TICKET-123: Describe change).\n".to_string()
+        let example = detected_format
+            .as_ref()
+            .map(|format| format.generic_example(summary_placeholder))
+            .unwrap_or_else(|| format!("TICKET-123: {summary_placeholder}"));
+        format!(
+            "When a ticket reference is available, mirror the repository style (e.g. \"{example}\").\n"
+        )
     } else {
         String::new()
     };
@@ -1099,6 +1233,83 @@ fn extract_ticket(name: &str) -> Option<&str> {
     TICKET_RE
         .captures(name)
         .and_then(|caps| caps.get(1).map(|m| m.as_str()))
+}
+
+fn detect_ticket_format(messages: &[String]) -> Option<TicketFormat> {
+    messages
+        .iter()
+        .find_map(|message| parse_ticket_format(message))
+}
+
+fn parse_ticket_format(message: &str) -> Option<TicketFormat> {
+    if let Some(format) = parse_bracketed_ticket(message) {
+        return Some(format);
+    }
+    parse_leading_ticket(message)
+}
+
+fn parse_bracketed_ticket(message: &str) -> Option<TicketFormat> {
+    if !message.starts_with('[') {
+        return None;
+    }
+    let closing = message.find(']')?;
+    let candidate = &message[1..closing];
+    if !is_ticket_identifier(candidate) {
+        return None;
+    }
+    let separator = separator_after(&message[closing + 1..]);
+    Some(TicketFormat {
+        prefix: "[".to_string(),
+        suffix: "]".to_string(),
+        separator,
+    })
+}
+
+fn parse_leading_ticket(message: &str) -> Option<TicketFormat> {
+    let mut end = 0;
+    for (idx, ch) in message.char_indices() {
+        if ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '-' {
+            end = idx + ch.len_utf8();
+            continue;
+        }
+        break;
+    }
+    if end == 0 {
+        return None;
+    }
+    let candidate = &message[..end];
+    if !is_ticket_identifier(candidate) {
+        return None;
+    }
+    let separator = separator_after(&message[end..]);
+    Some(TicketFormat {
+        prefix: String::new(),
+        suffix: String::new(),
+        separator,
+    })
+}
+
+fn separator_after(segment: &str) -> String {
+    if segment.is_empty() {
+        return " ".to_string();
+    }
+    let mut end = 0;
+    for (idx, ch) in segment.char_indices() {
+        if ch.is_alphanumeric() || ch == '\n' || ch == '\r' {
+            break;
+        }
+        end = idx + ch.len_utf8();
+    }
+    if end == 0 {
+        " ".to_string()
+    } else {
+        segment[..end].to_string()
+    }
+}
+
+fn is_ticket_identifier(candidate: &str) -> bool {
+    static TICKET_ONLY_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[A-Z]{2,}-\d{1,6}$").unwrap());
+    TICKET_ONLY_RE.is_match(candidate)
 }
 
 fn sanitize_plan(plan: &mut AiPlan, context: &CommitContext) {
