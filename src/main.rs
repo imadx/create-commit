@@ -693,17 +693,71 @@ impl OllamaClient {
     }
 
     async fn build_plan(&self, prompts: &PromptBundle) -> Result<AiPlan> {
-        let mut user_prompt = prompts.user.clone();
-        user_prompt.push_str(
-            "\nRespond ONLY with a single JSON object matching the schema. \
+        let base_prompt = format!(
+            "{}\nRespond ONLY with a single JSON object matching the schema. \
 Do not include markdown code fences or additional narration.",
+            prompts.user
         );
 
+        let example_plan = json!({
+            "commits": [
+                {
+                    "title": "TICKET-123: Describe the change",
+                    "files": ["path/to/file"]
+                }
+            ]
+        });
+        let mut example_text = serde_json::to_string_pretty(&example_plan)?;
+        example_text.push_str(
+            "\nOptional fields (`body`, `rationale`, `notes`) may be included when needed, but the structure must stay the same."
+        );
+
+        let prompt_variants = [
+            base_prompt.clone(),
+            format!(
+                "{}\nThe JSON MUST include a top-level `commits` array that follows the provided schema. \
+Avoid returning unrelated JSON structures.",
+                base_prompt
+            ),
+            format!(
+                "{}\nReturn JSON that mirrors this template exactly:\n{}",
+                base_prompt, example_text
+            ),
+        ];
+
+        let mut last_error: Option<anyhow::Error> = None;
+        for user_prompt in prompt_variants {
+            match self
+                .request_plan_content(&prompts.system, &user_prompt)
+                .await
+            {
+                Ok(content) => match parse_json_str::<AiPlan>(&content) {
+                    Ok(plan) if !plan.commits.is_empty() => return Ok(plan),
+                    Ok(_) => {
+                        last_error = Some(anyhow!(
+                            "Ollama returned a plan without any commits; content snippet: {}",
+                            truncate(&content, 500)
+                        ));
+                    }
+                    Err(err) => {
+                        last_error = Some(anyhow!("failed to parse plan JSON from Ollama: {err}"));
+                    }
+                },
+                Err(err) => {
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("failed to obtain plan from Ollama")))
+    }
+
+    async fn request_plan_content(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
         let body = json!({
             "model": self.model,
             "format": "json",
             "messages": [
-                {"role": "system", "content": prompts.system.as_str()},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
             "stream": false,
@@ -738,14 +792,7 @@ Do not include markdown code fences or additional narration.",
         if content.trim().is_empty() {
             bail!("Ollama returned an empty message");
         }
-
-        let plan: AiPlan = serde_json::from_str(&content).map_err(|err| {
-            anyhow!(
-                "failed to parse plan JSON from Ollama: {err}; content snippet: {}",
-                truncate(&content, 500)
-            )
-        })?;
-        Ok(plan)
+        Ok(content)
     }
 
     async fn refine_commits(&self, plan: &mut AiPlan, context: &CommitContext) -> Result<()> {
@@ -941,12 +988,13 @@ where
                     "Attempting to parse extracted JSON snippet: {}",
                     truncate(&extracted, 200)
                 ));
-                serde_json::from_str(&extracted).map_err(|err| {
-                    anyhow!(
+                match serde_json::from_str(&extracted) {
+                    Ok(value) => Ok(value),
+                    Err(err) => Err(anyhow!(
                         "failed to parse JSON after extraction: {err}; original content snippet: {}",
                         truncate(content, 500)
-                    )
-                })
+                    )),
+                }
             } else {
                 Err(anyhow!(
                     "failed to parse JSON: {primary_err}; content snippet: {}",
@@ -1149,7 +1197,9 @@ fn extract_ticket(name: &str) -> Option<&str> {
 }
 
 fn detect_ticket_format(messages: &[String]) -> Option<TicketFormat> {
-    messages.iter().find_map(|message| parse_ticket_format(message))
+    messages
+        .iter()
+        .find_map(|message| parse_ticket_format(message))
 }
 
 fn parse_ticket_format(message: &str) -> Option<TicketFormat> {
@@ -1219,8 +1269,7 @@ fn separator_after(segment: &str) -> String {
 }
 
 fn is_ticket_identifier(candidate: &str) -> bool {
-    static TICKET_ONLY_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"^[A-Z]{2,}-\d{1,6}$").unwrap());
+    static TICKET_ONLY_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[A-Z]{2,}-\d{1,6}$").unwrap());
     TICKET_ONLY_RE.is_match(candidate)
 }
 
