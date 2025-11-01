@@ -220,71 +220,110 @@ async fn run() -> Result<()> {
         bail!("staged changes detected; run with --allow-dirty-index to override");
     }
 
-    let recent_commits = git.recent_commit_messages(cli.history_limit)?;
-    let branch = git.current_branch()?;
-    let ticket_hint = branch
-        .as_ref()
-        .and_then(|name| extract_ticket(name))
-        .map(|s| s.to_string());
-    let ticket_required = ticket_hint.as_ref().map_or(false, |ticket| {
-        recent_commits.iter().any(|msg| msg.contains(ticket))
-    });
-
-    progress("Analyzing working tree changes...");
-    let status_entries = git.status_entries()?;
-    if status_entries.is_empty() {
-        bail!("no changes detected in the working tree");
-    }
-
-    let diffs = git.collect_diffs(&status_entries, cli.diff_char_limit)?;
-    let context = CommitContext {
-        branch: branch.clone(),
-        ticket_hint,
-        ticket_required,
-        recent_commit_examples: recent_commits,
-        changes: diffs,
-    };
-
-    let prompts = build_prompts(&context)?;
-    debug_log(&format!("System prompt: {}", prompts.system));
-    debug_log(&format!(
-        "User prompt snippet: {}",
-        truncate(&prompts.user, 500)
-    ));
     let ai_client = AiClient::new(&cli).await?;
-    progress(&format!(
-        "Contacting {} for commit plan (this may take a moment)...",
-        cli.provider
-    ));
-    let mut plan = ai_client.build_plan(&prompts).await?;
-    sanitize_plan(&mut plan, &context);
-    ai_client.refine_commits(&mut plan, &context).await?;
-    progress(&format!(
-        "Received AI plan with {} proposed commit(s)",
-        plan.commits.len()
-    ));
 
-    if cli.dry_run {
-        progress("Dry run enabled; no commits will be created.");
-        print_plan(&plan)?;
-        return Ok(());
+    let mut pass = 1usize;
+    let mut all_commits = Vec::new();
+    let mut aggregated_notes = Vec::new();
+
+    loop {
+        if pass == 1 {
+            progress("Analyzing working tree changes...");
+        } else {
+            progress(&format!("Analyzing remaining changes (pass #{pass})..."));
+        }
+
+        let status_entries = git.status_entries()?;
+        if status_entries.is_empty() {
+            if pass == 1 {
+                bail!("no changes detected in the working tree");
+            } else {
+                break;
+            }
+        }
+
+        let diffs = git.collect_diffs(&status_entries, cli.diff_char_limit)?;
+        let recent_commits = git.recent_commit_messages(cli.history_limit)?;
+        let branch = git.current_branch()?;
+        let ticket_hint = branch
+            .as_ref()
+            .and_then(|name| extract_ticket(name))
+            .map(|s| s.to_string());
+        let ticket_required = ticket_hint.as_ref().map_or(false, |ticket| {
+            recent_commits.iter().any(|msg| msg.contains(ticket))
+        });
+
+        let context = CommitContext {
+            branch: branch.clone(),
+            ticket_hint,
+            ticket_required,
+            recent_commit_examples: recent_commits,
+            changes: diffs,
+        };
+
+        let prompts = build_prompts(&context)?;
+        debug_log(&format!("System prompt: {}", prompts.system));
+        debug_log(&format!(
+            "User prompt snippet: {}",
+            truncate(&prompts.user, 500)
+        ));
+
+        progress(&format!(
+            "Contacting {} for commit plan (pass #{pass}, this may take a moment)...",
+            cli.provider
+        ));
+        let mut plan = ai_client.build_plan(&prompts).await?;
+        sanitize_plan(&mut plan, &context);
+        ai_client.refine_commits(&mut plan, &context).await?;
+        progress(&format!(
+            "Received AI plan with {} proposed commit(s) in pass #{}",
+            plan.commits.len(),
+            pass
+        ));
+
+        if cli.dry_run {
+            progress("Dry run enabled; no commits will be created.");
+            print_plan(&plan)?;
+            return Ok(());
+        }
+
+        if pass == 1 {
+            progress("Ensuring repository is in sync...");
+            git.ensure_head_in_sync()?;
+        }
+
+        progress("Applying commit plan...");
+        let applied = git.apply_plan(&plan)?;
+        if applied.is_empty() {
+            bail!("no commits were created; check plan output or run with --dry-run");
+        }
+        progress(&format!(
+            "Completed pass #{} with {} commit(s).",
+            pass,
+            applied.len()
+        ));
+        all_commits.extend(applied);
+        if let Some(notes) = plan.notes.as_ref() {
+            aggregated_notes.push(notes.clone());
+        }
+
+        pass += 1;
     }
 
-    progress("Ensuring repository is in sync...");
-    git.ensure_head_in_sync()?;
-    progress("Applying commit plan...");
-    let applied = git.apply_plan(&plan)?;
-    if applied.is_empty() {
+    if all_commits.is_empty() {
         bail!("no commits were created; check plan output or run with --dry-run");
     }
 
-    println!("Created {} commit(s):", applied.len());
-    for commit in applied {
+    println!("Created {} commit(s):", all_commits.len());
+    for commit in &all_commits {
         println!("  - {}", commit);
     }
 
-    if let Some(notes) = plan.notes.as_ref() {
-        println!("\nAdditional notes:\n{notes}");
+    if !aggregated_notes.is_empty() {
+        println!("\nAdditional notes:");
+        for notes in aggregated_notes {
+            println!("{notes}");
+        }
     }
 
     Ok(())
