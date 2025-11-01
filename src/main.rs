@@ -101,6 +101,26 @@ struct CommitContext {
     changes: Vec<FileDiff>,
 }
 
+#[derive(Debug, Clone)]
+struct TicketFormat {
+    prefix: String,
+    suffix: String,
+    separator: String,
+}
+
+impl TicketFormat {
+    fn with_summary(&self, ticket: &str, summary: &str) -> String {
+        format!(
+            "{}{}{}{}{}",
+            self.prefix, ticket, self.suffix, self.separator, summary
+        )
+    }
+
+    fn generic_example(&self, summary: &str) -> String {
+        self.with_summary("TICKET-123", summary)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct AiPlan {
     commits: Vec<AiCommit>,
@@ -1034,14 +1054,35 @@ Respect project conventions, include ticket identifiers when appropriate, \
 and prefer smaller, focused commits.";
 
     let context_json = serde_json::to_string_pretty(context)?;
+    let summary_placeholder = "Describe the change";
+    let detected_format = detect_ticket_format(&context.recent_commit_examples);
     let ticket_line = match (context.ticket_hint.as_deref(), context.ticket_required) {
-        (Some(ticket), true) => format!(
-            "Every commit title must begin with \"{ticket}: \" followed by a concise summary. \
+        (Some(ticket), true) => {
+            if let Some(format) = detected_format.as_ref() {
+                let example = format.with_summary(ticket, summary_placeholder);
+                format!(
+                    "Every commit title must begin with \"{example}\" (replace the summary text with an accurate description). \
 This convention is mandatory because recent commits use it."
-        ),
-        (Some(ticket), false) => format!(
-            "Prefer including the ticket identifier \"{ticket}\" in titles when it naturally fits."
-        ),
+                )
+            } else {
+                format!(
+                    "Every commit title must begin with \"{ticket}: {summary_placeholder}\" (adjust the summary to fit). \
+This convention is mandatory because recent commits use it."
+                )
+            }
+        }
+        (Some(ticket), false) => {
+            if let Some(format) = detected_format.as_ref() {
+                let example = format.with_summary(ticket, summary_placeholder);
+                format!(
+                    "Prefer starting the title with \"{example}\" when it suits the change, mirroring the existing history."
+                )
+            } else {
+                format!(
+                    "Prefer including the ticket identifier \"{ticket}\" in titles when it naturally fits."
+                )
+            }
+        }
         (None, _) => String::new(),
     };
 
@@ -1052,7 +1093,13 @@ This convention is mandatory because recent commits use it."
     };
 
     let ticket_general = if context.ticket_hint.is_some() {
-        "When a ticket reference is available, prepend it followed by a concise summary (e.g. TICKET-123: Describe change).\n".to_string()
+        let example = detected_format
+            .as_ref()
+            .map(|format| format.generic_example(summary_placeholder))
+            .unwrap_or_else(|| format!("TICKET-123: {summary_placeholder}"));
+        format!(
+            "When a ticket reference is available, mirror the repository style (e.g. \"{example}\").\n"
+        )
     } else {
         String::new()
     };
@@ -1099,6 +1146,82 @@ fn extract_ticket(name: &str) -> Option<&str> {
     TICKET_RE
         .captures(name)
         .and_then(|caps| caps.get(1).map(|m| m.as_str()))
+}
+
+fn detect_ticket_format(messages: &[String]) -> Option<TicketFormat> {
+    messages.iter().find_map(|message| parse_ticket_format(message))
+}
+
+fn parse_ticket_format(message: &str) -> Option<TicketFormat> {
+    if let Some(format) = parse_bracketed_ticket(message) {
+        return Some(format);
+    }
+    parse_leading_ticket(message)
+}
+
+fn parse_bracketed_ticket(message: &str) -> Option<TicketFormat> {
+    if !message.starts_with('[') {
+        return None;
+    }
+    let closing = message.find(']')?;
+    let candidate = &message[1..closing];
+    if !is_ticket_identifier(candidate) {
+        return None;
+    }
+    let separator = separator_after(&message[closing + 1..]);
+    Some(TicketFormat {
+        prefix: "[".to_string(),
+        suffix: "]".to_string(),
+        separator,
+    })
+}
+
+fn parse_leading_ticket(message: &str) -> Option<TicketFormat> {
+    let mut end = 0;
+    for (idx, ch) in message.char_indices() {
+        if ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '-' {
+            end = idx + ch.len_utf8();
+            continue;
+        }
+        break;
+    }
+    if end == 0 {
+        return None;
+    }
+    let candidate = &message[..end];
+    if !is_ticket_identifier(candidate) {
+        return None;
+    }
+    let separator = separator_after(&message[end..]);
+    Some(TicketFormat {
+        prefix: String::new(),
+        suffix: String::new(),
+        separator,
+    })
+}
+
+fn separator_after(segment: &str) -> String {
+    if segment.is_empty() {
+        return " ".to_string();
+    }
+    let mut end = 0;
+    for (idx, ch) in segment.char_indices() {
+        if ch.is_alphanumeric() || ch == '\n' || ch == '\r' {
+            break;
+        }
+        end = idx + ch.len_utf8();
+    }
+    if end == 0 {
+        " ".to_string()
+    } else {
+        segment[..end].to_string()
+    }
+}
+
+fn is_ticket_identifier(candidate: &str) -> bool {
+    static TICKET_ONLY_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^[A-Z]{2,}-\d{1,6}$").unwrap());
+    TICKET_ONLY_RE.is_match(candidate)
 }
 
 fn sanitize_plan(plan: &mut AiPlan, context: &CommitContext) {
